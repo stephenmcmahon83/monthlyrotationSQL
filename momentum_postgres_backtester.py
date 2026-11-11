@@ -8,9 +8,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🚀 6,000-Ticker Cross-Sectional Momentum Backtester (PostgreSQL)")
+st.title("🚀 Cross-Sectional Momentum Backtester (`stock_market_db`)")
 st.markdown("""
-**Strategy Logic:** At each rebalance, rank all stocks in your PostgreSQL database by their **prior $L$-day return** (default 30 trading days). 
+**Strategy Logic:** At each rebalance, rank all stocks in `stock_prices_daily` by their **prior $L$-day return** (default 30 trading days). 
 Filter for stocks with **Average Daily Volume $\\ge$ 300,000 shares** and **no single overnight gap-up $\\ge$ 30%** during the lookback window. 
 Buy the **Top 10 stocks** on the next morning's Open, hold for **$X$ trading days**, and deduct **$1.00 per trade** in commissions.
 """)
@@ -39,7 +39,7 @@ min_adv = st.sidebar.number_input("Min 30-Day Avg Daily Volume (Shares)", min_va
 max_overnight_gap_pct = st.sidebar.slider(
     "Exclude If Max Overnight Gap-Up >= (%)",
     min_value=5.0, max_value=100.0, value=30.0, step=2.5,
-    help="Excludes any stock that had a single overnight gap (Open_t / Close_{t-1} - 1) >= this threshold during the 30-day lookback window."
+    help="Excludes any stock that had a single overnight gap (Open_t / Close_{t-1} - 1) >= this threshold during the lookback window."
 ) / 100.0
 also_cap_daily_ret = st.sidebar.checkbox(
     "Also apply gap cap to Total Daily Return (Close_t / Close_{t-1} - 1)",
@@ -75,7 +75,6 @@ run_btn = st.sidebar.button("🚀 Load Data & Run Backtest", type="primary", use
 def load_matrix_from_postgres(host, port, dbname, user, password, table, s_year, e_year):
     conn_str = f"host={host} port={port} dbname={dbname} user={user} password={password}"
     with psycopg.connect(conn_str) as conn:
-        # Inspect actual column names in table to handle schema variations automatically
         with conn.cursor() as cur:
             cur.execute(f"SELECT * FROM {table} LIMIT 1")
             col_names = [desc[0].lower() for desc in cur.description]
@@ -107,7 +106,6 @@ def load_matrix_from_postgres(host, port, dbname, user, password, table, s_year,
     df['date'] = pd.to_datetime(df['date'])
     df = df.drop_duplicates(subset=['date', 'ticker'], keep='last')
 
-    # Pivot into fast (Date x Ticker) float32 matrices
     open_mat = df.pivot(index='date', columns='ticker', values='open').astype(np.float32)
     close_mat = df.pivot(index='date', columns='ticker', values='close').astype(np.float32)
     vol_mat = df.pivot(index='date', columns='ticker', values='volume').fillna(0.0).astype(np.float32)
@@ -128,27 +126,18 @@ def run_momentum_backtest(
     tickers = close_mat.columns.to_numpy()
     n_days, n_tickers = close_mat.shape
 
-    # 1. Prior L-Day Momentum Return: Close_t / Close_{t - lookback} - 1
     mom_ret = (close_mat / close_mat.shift(lookback)) - 1.0
-
-    # 2. Rolling L-Day Average Daily Volume (ADV)
     adv_mat = vol_mat.rolling(window=lookback, min_periods=lookback).mean()
 
-    # 3. Overnight Gap Up: (Open_t - Close_{t-1}) / Close_{t-1}
     prev_close = close_mat.shift(1)
     overnight_gap = (open_mat - prev_close) / prev_close
     if cap_daily:
         daily_cc = (close_mat - prev_close) / prev_close
         overnight_gap = np.maximum(overnight_gap, daily_cc)
 
-    # Rolling Max Overnight Gap over the exact L-day window [t - lookback + 1 ... t]
     max_gap_window = overnight_gap.rolling(window=lookback, min_periods=max(1, lookback // 2)).max()
-
-    # 4. Daily Close-to-Close returns for mark-to-market tracking during the hold
-    # Note: We do NOT forward-fill across dead tickers unless needed, and clamp extreme data errors
     close_ffill = close_mat.ffill(limit=5)
 
-    # Convert to NumPy arrays for ultra-fast rebalance loop
     mom_arr = mom_ret.to_numpy()
     adv_arr = adv_mat.to_numpy()
     gap_arr = max_gap_window.to_numpy()
@@ -157,7 +146,6 @@ def run_momentum_backtest(
 
     comm_per_position = (comm_val * 2.0) if "Order Leg" in mode_comm else comm_val
 
-    # Track daily portfolio equity
     start_idx = lookback + 1
     if start_idx >= n_days - 2:
         return pd.DataFrame(), pd.DataFrame()
@@ -171,14 +159,11 @@ def run_momentum_backtest(
 
     rebalance_logs = []
 
-    # Step through time in non-overlapping blocks of `hold_x` trading days
-    # Signal evaluated at Close of day `sig_i` -> Enter at Open of `entry_i = sig_i + 1` -> Exit at Close of `exit_i = min(entry_i + hold_x - 1, n_days - 1)`
     sig_i = lookback
     while sig_i + 1 < n_days:
         entry_i = sig_i + 1
         exit_i = min(entry_i + hold_x - 1, n_days - 1)
 
-        # Evaluate eligibility at sig_i (Close of Day t) AND verify stock has a valid Open price on entry_i (Day t+1)
         m_row = mom_arr[sig_i]
         v_row = adv_arr[sig_i]
         g_row = gap_arr[sig_i]
@@ -195,30 +180,26 @@ def run_momentum_backtest(
             (c_row >= min_px) &
             (v_row >= min_vol) &
             (g_row < max_gap) &
-            (m_row > 0.0)  # Top performers must have positive 30-day momentum
+            (m_row > 0.0)
         )
 
         valid_indices = np.where(valid_mask)[0]
 
         if len(valid_indices) == 0:
-            # Stay in cash for this hold_x window
             daily_equity[entry_i:exit_i + 1] = current_equity
             sig_i = exit_i
             continue
 
-        # Sort valid candidates by 30-day return descending and pick Top N
         valid_rets = m_row[valid_indices]
         top_order = np.argsort(valid_rets)[::-1][:top_k]
         chosen_idx = valid_indices[top_order]
         actual_k = len(chosen_idx)
 
-        # Determine capital deployed per slot
         if "Compounding" in mode_sizing:
             alloc_per_stock = max(current_equity / top_k, 0.0)
             slot_allocs = np.full(actual_k, alloc_per_stock, dtype=np.float64)
             undeployed_cash = current_equity - np.sum(slot_allocs)
         else:
-            # Capped at initial_slot_cap, shrinks if slot lost money
             slot_allocs = np.minimum(np.maximum(slot_equities[:actual_k], 0.0), initial_slot_cap)
             undeployed_cash = current_equity - np.sum(slot_allocs)
 
@@ -227,18 +208,14 @@ def run_momentum_backtest(
         invested_dollars = shares * entry_prices
         leftover_cash = np.sum(slot_allocs - invested_dollars) + undeployed_cash
 
-        # Deduct entry + exit commissions for the batch
         total_batch_comm = actual_k * comm_per_position
 
-        # Compute daily mark-to-market portfolio equity for every day d in [entry_i ... exit_i]
         for d in range(entry_i, exit_i + 1):
             cur_closes = close_arr[d, chosen_idx]
-            # If a stock has a missing close on day d, fallback to entry_prices
             cur_closes = np.where(np.isfinite(cur_closes) & (cur_closes > 0), cur_closes, entry_prices)
             pos_values = shares * cur_closes
             daily_equity[d] = leftover_cash + np.sum(pos_values) - total_batch_comm
 
-        # Finalize batch exit at Close of exit_i
         exit_prices = close_arr[exit_i, chosen_idx]
         exit_prices = np.where(np.isfinite(exit_prices) & (exit_prices > 0), exit_prices, entry_prices)
         gross_pnls = (exit_prices - entry_prices) * shares
@@ -248,7 +225,6 @@ def run_momentum_backtest(
         if "Capped" in mode_sizing:
             slot_equities[:actual_k] += net_pnls
 
-        # Log individual stock trades in this rebalance cohort
         for j in range(actual_k):
             t_idx = chosen_idx[j]
             rebalance_logs.append({
@@ -256,9 +232,9 @@ def run_momentum_backtest(
                 'Entry Date (Open)': dates[entry_i].strftime('%Y-%m-%d'),
                 'Exit Date (Close)': dates[exit_i].strftime('%Y-%m-%d'),
                 'Ticker': tickers[t_idx],
-                'Prior 30d Return (%)': round(float(m_row[t_idx]) * 100, 2),
+                'Prior Lookback Return (%)': round(float(m_row[t_idx]) * 100, 2),
                 '30d Avg Volume': int(v_row[t_idx]),
-                'Max 30d Overnight Gap (%)': round(float(g_row[t_idx]) * 100, 2),
+                'Max Lookback Overnight Gap (%)': round(float(g_row[t_idx]) * 100, 2),
                 'Allocation ($)': round(float(invested_dollars[j]), 2),
                 'Shares': int(shares[j]),
                 'Entry Open ($)': round(float(entry_prices[j]), 2),
@@ -323,7 +299,6 @@ if run_btn or 'postgres_loaded' in st.session_state:
         st.warning("No trades matched your filter criteria. Try lowering the minimum volume or adjusting the gap filter.")
         st.stop()
 
-    # Calculate Overall Metrics
     eq_df['Daily_Ret'] = eq_df['Equity'].pct_change().fillna(0.0)
     eq_df['Peak_Equity'] = eq_df['Equity'].cummax()
     eq_df['Drawdown_Pct'] = (eq_df['Equity'] - eq_df['Peak_Equity']) / eq_df['Peak_Equity'] * 100.0
@@ -349,7 +324,6 @@ if run_btn or 'postgres_loaded' in st.session_state:
     m5.metric("Annualized Sharpe", f"{ann_sharpe:.2f}")
     m6.metric("Total Stock Trades", f"{len(trades_df):,}", f"Win Rate: {win_rate_trades:.1f}%")
 
-    # Equity Curve & Drawdown Curve
     col_chart1, col_chart2 = st.columns(2)
     with col_chart1:
         st.subheader("📈 Daily Mark-to-Market Portfolio Equity ($)")
@@ -358,7 +332,6 @@ if run_btn or 'postgres_loaded' in st.session_state:
         st.subheader("📉 Daily Underwater Drawdown (%)")
         st.line_chart(eq_df.set_index('Date')['Drawdown_Pct'])
 
-    # Year-by-Year Return Table
     st.subheader("📅 Year-by-Year Performance Breakdown")
     eq_df['Year'] = eq_df['Date'].dt.year
     yearly_rows = []
@@ -369,7 +342,6 @@ if run_btn or 'postgres_loaded' in st.session_state:
         yr_pnl = yr_end_eq - prev_yr_end_eq
         yr_ret_pct = (yr_pnl / prev_yr_end_eq) * 100.0 if prev_yr_end_eq > 0 else 0.0
 
-        # Intra-year max drawdown
         yr_peak = grp['Equity'].cummax()
         yr_max_dd = ((grp['Equity'] - yr_peak) / yr_peak * 100.0).min()
 
@@ -392,8 +364,9 @@ if run_btn or 'postgres_loaded' in st.session_state:
     yr_df = pd.DataFrame(yearly_rows)
     st.dataframe(yr_df, use_container_width=True)
 
-    # Rebalance & Trade Log
     st.subheader(f"📋 Master Trade & Rebalance Log (Top {top_n} Stocks Held for {hold_days} Days)")
     st.dataframe(trades_df, use_container_width=True, height=450)
 else:
     st.info("👈 Enter your PostgreSQL password in the sidebar and click **Load Data & Run Backtest** to start.")
+
+# === END OF FILE ===
